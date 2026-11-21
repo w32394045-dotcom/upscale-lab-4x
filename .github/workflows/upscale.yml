@@ -1,0 +1,188 @@
+name: upscale4x
+
+# Public repo => 4 vCPU / 16 GB runners and generous minutes.
+# One dispatch fans the pages out over up to 20 parallel jobs, then merges.
+
+on:
+  workflow_dispatch:
+    inputs:
+      input_url:
+        description: "URL of a zip with the page images (leave empty to use samples/)"
+        required: false
+        default: ""
+      shards:
+        description: "how many parallel jobs (1-20)"
+        required: false
+        default: "10"
+      tile:
+        description: "tile size in pixels (0 = whole image)"
+        required: false
+        default: "256"
+      overlap:
+        description: "tile overlap in pixels"
+        required: false
+        default: "16"
+      make_pdf:
+        description: "merge into one A4 PDF"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.split.outputs.matrix }}
+      pages: ${{ steps.count.outputs.pages }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch input pages
+        run: |
+          set -euo pipefail
+          mkdir -p input
+          if [ -n "${{ inputs.input_url }}" ]; then
+            curl -fsSL "${{ inputs.input_url }}" -o input.zip
+            unzip -q -o input.zip -d input
+          else
+            python3 tools/make_samples.py input
+          fi
+          find input -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' \) \
+            -printf '%P\n' | sort > list.txt
+          head -n 5 list.txt
+          wc -l list.txt
+
+      - name: Count pages
+        id: count
+        run: echo "pages=$(wc -l < list.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Split into shards
+        id: split
+        run: |
+          set -euo pipefail
+          python3 tools/split_shards.py --list list.txt --shards "${{ inputs.shards }}" --out-dir shards > shards.out
+          head -n 1 shards.out
+          echo "matrix=$(tail -n 1 shards.out)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: input
+          path: input
+          retention-days: 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shards
+          path: shards
+          retention-days: 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: list
+          path: list.txt
+          retention-days: 2
+
+  upscale:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: input
+          path: input
+      - uses: actions/download-artifact@v4
+        with:
+          name: shards
+          path: shards
+
+      - name: Install python deps
+        run: |
+          python3 -m pip install --quiet --upgrade pip
+          python3 -m pip install --quiet onnxruntime numpy opencv-python-headless pillow
+
+      - name: Fetch model (cached)
+        id: model
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: model-ultrasharpv2-fp32-op17
+
+      - name: Download model if missing
+        if: steps.model.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p models
+          curl -fL --retry 3 -o models/4x-UltraSharpV2_fp32_op17.onnx \
+            https://huggingface.co/Kim2091/UltraSharpV2/resolve/main/4x-UltraSharpV2_fp32_op17.onnx
+          ls -l models
+
+      - name: Upscale shard ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          nproc
+          python3 tools/upscale.py \
+            --indir input --outdir out \
+            --list "shards/shard-$(printf '%02d' ${{ matrix.shard }}).txt" \
+            --model models/4x-UltraSharpV2_fp32_op17.onnx \
+            --tile "${{ inputs.tile }}" --overlap "${{ inputs.overlap }}" \
+            --threads 4 --format png
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: out-${{ matrix.shard }}
+          path: out
+          retention-days: 2
+
+  merge:
+    needs: [plan, upscale]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: out-*
+          path: out
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: list
+          path: .
+      - uses: actions/download-artifact@v4
+        with:
+          name: input
+          path: input
+
+      - name: Install python deps
+        run: python3 -m pip install --quiet img2pdf
+
+      - name: Build PDF
+        if: ${{ inputs.make_pdf }}
+        run: |
+          set -euo pipefail
+          ls out | head -n 5
+          python3 tools/make_pdf.py --dir out --list list.txt --out book-4x-a4.pdf --paper A4
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result
+          path: |
+            book-4x-a4.pdf
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Summary
+        run: |
+          {
+            echo "### upscale4x"
+            echo "- pages planned: ${{ needs.plan.outputs.pages }}"
+            echo "- shards: ${{ needs.plan.outputs.matrix }}"
+            echo "- tile: ${{ inputs.tile }} overlap: ${{ inputs.overlap }}"
+          } >> "$GITHUB_STEP_SUMMARY"
