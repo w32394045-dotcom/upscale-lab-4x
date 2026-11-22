@@ -30,9 +30,17 @@ on:
         description: "runner label: ubuntu-latest (x86) or ubuntu-24.04-arm"
         required: false
         default: "ubuntu-latest"
+      jpeg_quality:
+        description: "quality of the extra lossy PDF (1-100)"
+        required: false
+        default: "90"
+      publish_release:
+        description: "publish both PDFs as release assets"
+        type: boolean
+        default: true
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   plan:
@@ -165,22 +173,71 @@ jobs:
           path: input
 
       - name: Install python deps
-        run: python3 -m pip install --quiet img2pdf
+        run: python3 -m pip install --quiet img2pdf pillow
 
-      - name: Build PDF
+      - name: Keep the raw upscaled pages (one PNG per page)
+        run: |
+          set -euo pipefail
+          mkdir -p pages
+          while IFS= read -r name; do
+            stem="${name%.*}"
+            for candidate in "$stem.png" "$stem.jpg" "$stem.jpeg"; do
+              if [ -f "out/$candidate" ]; then cp "out/$candidate" "pages/$candidate"; break; fi
+            done
+          done < list.txt
+          ls pages | wc -l
+          du -sh pages
+
+      - name: Build the lossless (Flate) PDF
         if: ${{ inputs.make_pdf }}
         run: |
           set -euo pipefail
-          ls out | head -n 5
-          python3 tools/make_pdf.py --dir out --list list.txt --out book-4x-a4.pdf --paper A4
+          python3 tools/make_pdf.py --dir out --list list.txt \
+            --out book-4x-flate.pdf --paper A4
+          ls -l book-4x-flate.pdf
+
+      - name: Build the lossy (JPEG) PDF
+        if: ${{ inputs.make_pdf }}
+        run: |
+          set -euo pipefail
+          python3 tools/make_pdf.py --dir out --list list.txt \
+            --out "book-4x-jpeg${{ inputs.jpeg_quality }}.pdf" --paper A4 \
+            --jpeg-quality "${{ inputs.jpeg_quality }}"
+          ls -l book-4x-*.pdf
 
       - uses: actions/upload-artifact@v4
         with:
-          name: result
-          path: |
-            book-4x-a4.pdf
+          name: pages-raw-png
+          path: pages
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pdf-flate
+          path: book-4x-flate.pdf
           if-no-files-found: warn
-          retention-days: 3
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pdf-lossy-jpeg
+          path: book-4x-jpeg*.pdf
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Publish both PDFs as release assets
+        if: ${{ inputs.make_pdf && inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="run-${{ github.run_id }}"
+          gh release create "$tag" \
+            --title "4x upscale run ${{ github.run_id }}" \
+            --notes "pages: ${{ needs.plan.outputs.pages }}, tile: ${{ inputs.tile }}, runner: ${{ inputs.runner }}" \
+            --prerelease || true
+          for f in book-4x-flate.pdf book-4x-jpeg*.pdf; do
+            [ -f "$f" ] && gh release upload "$tag" "$f" --clobber
+          done
+          gh release view "$tag" --json assets -q '.assets[] | "\(.name) \(.size)"'
 
       - name: Summary
         run: |
